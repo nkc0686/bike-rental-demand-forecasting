@@ -1,0 +1,505 @@
+---
+title: "Bike Rental Demand Forecasting in Washington, DC"
+author: "Nikki Carlson"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+    theme: flatly
+    highlight: tango
+    fig_caption: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 9,
+  fig.height = 5
+)
+```
+
+```{r custom-css, echo=FALSE, results='asis'}
+cat("
+<style>
+body {
+  font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
+  font-size: 18px;
+  line-height: 1.7;
+  color: #2b2b2b;
+}
+
+h1, h2, h3, h4 {
+  color: #1f3b57;
+  font-weight: 700;
+}
+
+h1.title {
+  font-size: 38px;
+  margin-bottom: 10px;
+}
+
+h1 {
+  border-bottom: 2px solid #d9e2ec;
+  padding-bottom: 8px;
+  margin-top: 36px;
+}
+
+h2 {
+  margin-top: 28px;
+}
+
+p {
+  margin-bottom: 16px;
+}
+
+.caption,
+.figcaption {
+  font-size: 15px;
+  color: #555555;
+  font-style: italic;
+  margin-top: 8px;
+}
+
+table {
+  width: auto;
+  margin-top: 12px;
+  margin-bottom: 24px;
+}
+
+table th {
+  background-color: #f4f6f8;
+}
+
+pre {
+  border-radius: 8px;
+}
+
+.tocify {
+  border-radius: 8px;
+  font-size: 15px;
+}
+
+blockquote {
+  border-left: 4px solid #1f3b57;
+  padding-left: 12px;
+  color: #444;
+}
+</style>
+")
+```
+![Cyclists riding along the Reflecting Pool near the Lincoln Memorial in Washington, DC.](dc_cyclists.png)
+
+**Data Analysis Project**  
+**Tools:** R (tidyverse, lubridate, tsibble, fable, feasts, ggplot2)  
+**Methods:** Time Series Analysis, ARIMA Forecasting, Cross-Validation  
+**Dataset:** UCI Machine Learning Repository – Bike Sharing Dataset (Washington, DC)
+
+# Introduction
+
+This report analyzes daily bike rental demand in the Washington, DC Capital Bikeshare system using historical data from 2011–2012. The objective is to explore rental patterns, identify seasonal behavior, and build forecasting models that can support operational planning and pricing decisions.
+
+> **Executive Summary:**  
+> Daily bike rental demand in Washington, DC shows clear seasonal variation and a strong relationship with temperature. Exploratory analysis highlights higher ridership in warmer months and lower ridership in colder periods. Cross-validation results indicate that ARIMA outperforms naive benchmark models for short-term forecasting. These forecasts can support seasonal fleet planning, maintenance scheduling, and resource allocation.
+
+## Business Objective
+
+Bike sharing systems must accurately forecast demand in order to manage fleet availability, station capacity, and operational costs. Reliable demand forecasts help operators determine how many bikes should be available at different times and locations, while also supporting pricing and maintenance planning.
+
+This analysis uses historical Capital Bikeshare data from Washington, DC to examine patterns in daily bike rental demand and develop forecasting models that support operational decision-making.
+
+## Data Description
+
+The dataset contains the daily count of rental bike transactions in the Capital Bikeshare system during 2011 and 2012, along with weather, season, and calendar variables.
+
+## Data Source
+
+[UCI Machine Learning Repository – Bike Sharing Dataset](https://archive.ics.uci.edu/ml/datasets/bike+sharing+dataset)
+
+## Relevant Paper
+
+Fanaee-T, H., & Gama, J. (2013). *Event labeling combining ensemble detectors and background knowledge.* Progress in Artificial Intelligence.
+
+# Data Preparation
+
+## Load Required Packages
+
+```{r packages}
+library(tidyverse)
+library(lubridate)
+library(tsibble)
+library(fable)
+library(feasts)
+library(fabletools)
+library(slider)
+library(kableExtra)
+```
+
+## Load the Data
+
+```{r load-data}
+raw <- readr::read_csv("day.csv", show_col_types = FALSE)
+```
+
+## Clean and Prepare the Data
+
+```{r data-prep}
+daily <- raw %>%
+  transmute(
+    date      = as.Date(dteday, format = "%m/%d/%Y"),
+    rentals   = cnt,
+    temp_cel  = temp * 41,
+    feel_cel  = atemp * 50,
+    humidity  = hum,
+    season    = factor(
+      season,
+      levels = 1:4,
+      labels = c("Spring", "Summer", "Fall", "Winter")
+    ),
+    weekday   = factor(
+      weekday,
+      levels = 0:6,
+      labels = c("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
+    ),
+    working   = as.logical(workingday),
+    holiday   = as.logical(holiday)
+  ) %>%
+  arrange(date)
+
+daily_ts <- daily %>% as_tsibble(index = date)
+```
+
+## Data Quality Check
+
+```{r data-quality-check}
+daily %>%
+  summarise(
+    missing_dates = sum(is.na(date)),
+    duplicate_dates = sum(duplicated(date)),
+    start_date = min(date),
+    end_date = max(date)
+  ) %>%
+  knitr::kable(
+    caption = "Table 1. Data quality check for the time index."
+  ) %>%
+  kableExtra::kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover", "condensed")
+  )
+```
+
+The dataset contains a complete daily time index with no missing or duplicated observations.
+
+## Summary Statistics
+
+```{r summary-stats}
+daily %>%
+  summarise(
+    days       = n(),
+    mean       = mean(rentals),
+    sd         = sd(rentals),
+    median     = median(rentals),
+    min        = min(rentals),
+    max        = max(rentals)
+  ) %>%
+  knitr::kable(
+    digits = 1,
+    caption = "Table 2. Summary statistics for daily bike rentals."
+  )
+```
+
+The dataset contains 731 daily observations across two full calendar years, which is sufficient for identifying broad trends and seasonal patterns.
+
+# Exploratory Data Analysis
+
+## Daily Rentals Over Time
+
+```{r daily-time-plot}
+daily %>%
+  ggplot(aes(date, rentals)) +
+  geom_line(alpha = 0.4, color = "gray50") +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 1, color = "#2C7FB8") +
+  labs(
+    title = "Daily Bike Rentals",
+    x = NULL,
+    y = "Rentals"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+The time plot shows a clear increase in bike rental demand from 2011 to 2012, along with strong seasonal fluctuations.
+
+## Rentals by Season
+
+```{r rentals-by-season}
+daily %>%
+  ggplot(aes(season, rentals, fill = season)) +
+  geom_boxplot(alpha = 0.75, outlier.alpha = 0.25) +
+  labs(
+    title = "Bike Rentals by Season",
+    x = NULL,
+    y = "Daily Rentals"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+Seasonal differences are substantial, with the highest rental activity occurring during warmer parts of the year.
+
+## Rentals vs Temperature
+
+```{r rentals-vs-temp}
+daily %>%
+  ggplot(aes(temp_cel, rentals, color = season)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(se = FALSE, method = "loess") +
+  labs(
+    title = "Bike Rentals vs Temperature",
+    x = "Temperature (C)",
+    y = "Daily Rentals"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+Bike rental demand generally rises as temperature increases, although the relationship is not perfectly linear.
+
+## Monthly Average Rentals
+
+```{r monthly-average-rentals}
+daily %>%
+  mutate(month = floor_date(date, "month")) %>%
+  group_by(month) %>%
+  summarise(rentals = mean(rentals), .groups = "drop") %>%
+  ggplot(aes(month, rentals)) +
+  geom_line(color = "#2C7FB8", linewidth = 1) +
+  labs(
+    title = "Monthly Average Bike Rentals",
+    x = NULL,
+    y = "Average Daily Rentals"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+Monthly aggregation highlights the annual cycle more clearly, with demand peaking in the warmer months.
+
+## Smoothed Trend
+
+```{r smoothed-trend}
+daily_smoothed <- daily %>%
+  mutate(
+    rentals_ma7  = slide_dbl(rentals, mean, .before = 6,  .complete = TRUE),
+    rentals_ma30 = slide_dbl(rentals, mean, .before = 29, .complete = TRUE)
+  )
+
+daily_smoothed %>%
+  select(date, rentals, rentals_ma7, rentals_ma30) %>%
+  pivot_longer(-date, names_to = "series", values_to = "value") %>%
+  ggplot(aes(date, value, color = series)) +
+  geom_line() +
+  labs(
+    title = "Observed and Smoothed Rental Trends",
+    x = NULL,
+    y = "Daily Rentals",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+The rolling averages help reveal the underlying trend by reducing short-term noise in the daily series.
+
+# Trend and Seasonality
+
+## STL Decomposition
+
+```{r stl}
+stl_fit <- daily_ts %>%
+  model(
+    STL(rentals ~ season(window = "periodic"), robust = TRUE)
+  )
+
+components(stl_fit) %>%
+  autoplot() +
+  labs(
+    title = "STL Decomposition of Daily Bike Rentals",
+    x = NULL,
+    y = "Rentals"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+The decomposition indicates a rising long-term trend and a strong recurring seasonal structure in the series.
+
+## Stationarity Testing
+
+```{r stationarity-test}
+n <- nrow(daily_ts)
+k_adf <- floor(12 * (n / 100)^(1/4))
+
+adf_level <- tseries::adf.test(daily_ts$rentals, k = k_adf)$p.value
+
+daily_ts <- daily_ts %>%
+  mutate(diff1 = difference(rentals))
+
+adf_diff1 <- tseries::adf.test(na.omit(daily_ts$diff1), k = k_adf)$p.value
+
+tibble(
+  Series = c("Original series", "First difference"),
+  `ADF p-value` = c(adf_level, adf_diff1)
+) %>%
+  knitr::kable(
+    digits = 4,
+    caption = "Table 3. Augmented Dickey–Fuller stationarity test results."
+  )
+```
+
+The Augmented Dickey–Fuller test suggests that the original rental series is non-stationary, while the differenced series is stationary and therefore better suited for ARIMA modeling.
+
+# Forecast Evaluation
+
+## Benchmark Models
+
+```{r benchmark-models}
+base_mods <- daily_ts %>%
+  model(
+    NAIVE  = NAIVE(rentals),
+    SNAIVE = SNAIVE(rentals ~ lag("week"))
+  )
+
+report(base_mods)
+```
+
+The naive and seasonal naive models provide simple benchmark forecasts that allow the ARIMA model to be evaluated against baseline performance.
+
+## ARIMA Model
+
+```{r arima-model}
+auto_fit <- daily_ts %>%
+  model(
+    ARIMA = ARIMA(rentals)
+  )
+
+report(auto_fit)
+```
+
+The automatic ARIMA procedure selects a model that captures both differencing and seasonal structure in the data.
+
+## Cross-Validation Comparison
+
+```{r cross-validation}
+set.seed(123)
+
+cv_tbl <- daily_ts %>%
+  stretch_tsibble(.init = 365, .step = 30) %>%
+  model(
+    NAIVE  = NAIVE(rentals),
+    SNAIVE = SNAIVE(rentals ~ lag("week")),
+    ARIMA  = ARIMA(rentals)
+  ) %>%
+  forecast(h = 30) %>%
+  accuracy(daily_ts)
+
+cv_tbl %>%
+  group_by(.model) %>%
+  summarise(
+    RMSE = mean(RMSE, na.rm = TRUE),
+    MAE  = mean(MAE, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(RMSE) %>%
+  knitr::kable(
+    digits = 1,
+    caption = "Table 4. Cross-validation comparison of forecasting models."
+  )
+```
+
+Cross-validation results show that the ARIMA model achieves the lowest RMSE and MAE among the models tested, outperforming both the naive and seasonal naive benchmarks. This suggests that ARIMA captures the structure of the series more effectively and provides stronger short-term forecasting performance for this dataset.
+
+## Final Forecast
+
+```{r final-forecast}
+final_fit <- daily_ts %>%
+  model(
+    ARIMA = ARIMA(rentals)
+  )
+
+fc <- forecast(final_fit, h = "60 days")
+
+autoplot(fc, daily_ts) +
+  labs(
+    title = "60-Day Forecast of Daily Bike Rentals",
+    x = NULL,
+    y = "Daily Rentals"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+The 60-day forecast projects future rental demand based on the historical pattern in the series. Forecast intervals widen over time, reflecting increasing uncertainty as the forecast horizon extends.
+
+## Model Diagnostics
+
+```{r model-diagnostics}
+aug <- augment(final_fit)
+
+aug %>%
+  features(.innov, ljung_box, lag = 24, dof = 2) %>%
+  knitr::kable(
+    digits = 4,
+    caption = "Table 5. Ljung–Box test results for ARIMA residuals."
+  )
+```
+
+The Ljung–Box test results show no significant residual autocorrelation, suggesting that the ARIMA model adequately captures the temporal structure of the series.
+
+# Conclusions and Recommendations
+
+## Key Findings
+
+- Daily bike rental demand increased between 2011 and 2012, indicating growing system usage during the study period.
+
+- Rental activity exhibits clear **seasonal patterns**, with higher ridership during warmer months and reduced usage during colder periods.
+
+- Temperature shows a **positive association with rental demand**, suggesting that weather conditions play an important role in influencing daily ridership levels.
+
+- Forecast evaluation indicates that the **ARIMA model provides more accurate short-term predictions** than simple naive benchmark models.
+
+## Business Recommendations
+
+- Increase bike availability and operational capacity in anticipation of **peak demand during warmer months**.
+
+- Schedule **maintenance and system upgrades during lower-demand periods**, particularly in colder seasons.
+
+- Use demand forecasts to support **staffing decisions, bike redistribution strategies, and inventory planning**.
+
+- Consider **weather-responsive pricing or promotional strategies** to help stabilize demand during shoulder seasons.
+
+## Limitations
+
+- The analysis relies on data from **2011–2012 only**, which may limit the generalizability of long-term demand patterns.
+
+- The dataset contains **system-wide daily totals rather than station-level observations**, preventing more detailed spatial analysis.
+
+- Potential explanatory factors such as **precipitation, special events, and pricing changes** are not included in the dataset.
+
+## Next Steps
+
+- Extend the analysis using additional years of data.
+
+- Incorporate richer weather variables and event-related predictors.
+
+- Build station-level forecasting models to support redistribution decisions.
+
+- Compare ARIMA forecasts with alternative approaches such as **ETS models or machine learning methods**.
+
+## References
+
+- UCI Machine Learning Repository. *Bike Sharing Dataset.*
+
+- Fanaee-T, H., & Gama, J. (2013). *Event labeling combining ensemble detectors and background knowledge.* Progress in Artificial Intelligence.
+
+- Hyndman, R. J., & Athanasopoulos, G. *Forecasting: Principles and Practice.*
+
+- Documentation for the **tsibble**, **fable**, **feasts**, and **tseries** R packages.
