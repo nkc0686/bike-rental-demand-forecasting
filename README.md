@@ -120,9 +120,9 @@ Possible extensions to the analysis include:
 
 ## Full Report
 
-The full project report can be viewed here:
+The complete analysis and forecasting report is available on RPubs:
 
-https://rpubs.com/Nikki0686/1410536
+https://rpubs.com/Nikki0686/bike-rental-demand-forecasting
 
 ---
 
